@@ -12,8 +12,13 @@
  *      Tarefa 3 - Exibição da temperatura e tendência no OLED
  *      Tarefa 4 - Cor da matriz NeoPixel por tendência
  *      Tarefa 5 - Alerta intermitente caso temperatura < 1°C
+ *      Tarefa 6 - Impressão de status no terminal USB
  *
- *  Data: 21/05/2025
+ *  Atualização:
+ *      Tarefas sincronizadas com base na Tarefa 1,
+ *      utilizando add_repeating_timer_ms e repeating_timer_callback.
+ *
+ *  Data: 25/05/2025
  * ------------------------------------------------------------
  */
 
@@ -28,126 +33,135 @@
 #include "tarefa3_tendencia.h"
 #include "tarefa4_controla_neopixel.h"
 #include "neopixel_driver.h"
-#include "testes_cores.h"  
+#include "testes_cores.h"
 #include "pico/stdio_usb.h"
 
-// Declaração das funções
-void tarefa_1();
-bool tarefa_2_callback(repeating_timer_t *rt);
-bool tarefa_3_callback(repeating_timer_t *rt);
-bool tarefa_4_callback(repeating_timer_t *rt);
-bool tarefa_5_callback(repeating_timer_t *rt);
+// Declaração das funções de tarefa
+void tarefa_1();                                     // Tarefa 1: leitura de temperatura via DMA
+bool tarefa_2_callback(repeating_timer_t *rt);       // Tarefa 2: tendência
+bool tarefa_3_callback(repeating_timer_t *rt);       // Tarefa 3: exibição OLED
+bool tarefa_4_callback(repeating_timer_t *rt);       // Tarefa 4: cor NeoPixel
+bool tarefa_5_callback(repeating_timer_t *rt);       // Tarefa 5: alerta intermitente
+bool tarefa_6_serial_monitor(repeating_timer_t *rt); // Tarefa 6: impressão no terminal USB
+void agendar_tarefas_dependentes(void);              // Agenda tarefas 2-6 após T1
 
-// Variáveis globais
-float media;
-tendencia_t t;
-bool alerta_estado = false;
+// Variáveis globais compartilhadas
+float media;               // Média da temperatura lida
+tendencia_t t;             // Tendência da temperatura (subida, queda ou estável)
+bool alerta_estado = false; // Estado atual do alerta no NeoPixel (ligado/desligado)
 
+// Marcação de tempo de execução de cada tarefa (para análise de desempenho)
 absolute_time_t ini_tarefa1, fim_tarefa1;
 absolute_time_t ini_tarefa2, fim_tarefa2;
 absolute_time_t ini_tarefa3, fim_tarefa3;
 absolute_time_t ini_tarefa4, fim_tarefa4;
 
+// Timers das tarefas (usados com os callbacks)
+static repeating_timer_t timer_tarefa2;
+static repeating_timer_t timer_tarefa3;
+static repeating_timer_t timer_tarefa4;
+static repeating_timer_t timer_tarefa5;
+static repeating_timer_t timer_tarefa6;
+
+/*******************************/
 int main() {
-    setup();  // Inicializações: ADC, DMA, interrupções, OLED, etc.
-
-    // Ativa o watchdog com timeout de 2 segundos
-    //watchdog_enable(2000, 1);
-
-    // Inicia os timers das tarefas assíncronas
-    static repeating_timer_t timer_tarefa2;
-    add_repeating_timer_ms(1000, tarefa_2_callback, NULL, &timer_tarefa2);
-
-     static repeating_timer_t timer_tarefa3;
-    add_repeating_timer_ms(1000, tarefa_3_callback, NULL, &timer_tarefa3);
-
-    static repeating_timer_t timer_tarefa4;
-    add_repeating_timer_ms(1000, tarefa_4_callback, NULL, &timer_tarefa4);
-
-    static repeating_timer_t timer_tarefa5;
-    add_repeating_timer_ms(1000, tarefa_5_callback, NULL, &timer_tarefa5);
+    setup();  // Inicializações de periféricos, sensores, interfaces
 
     while (true) {
-        //watchdog_update();  // Alimenta o watchdog no início do ciclo
+        //watchdog_update();  // Alimenta o watchdog (se ativado)
 
-        tarefa_1();
-       
-        // tarefa_2, tarefa_4 e tarefa_5 são chamadas automaticamente
-
-        // --- Cálculo dos tempos de execução ---
-        int64_t tempo1_us = absolute_time_diff_us(ini_tarefa1, fim_tarefa1);
-        int64_t tempo2_us = absolute_time_diff_us(ini_tarefa2, fim_tarefa2);
-        int64_t tempo3_us = absolute_time_diff_us(ini_tarefa3, fim_tarefa3);
-        int64_t tempo4_us = absolute_time_diff_us(ini_tarefa4, fim_tarefa4);
-
-        // --- Exibição no terminal ---
-        printf("Temperatura: %.2f °C | T1: %.3fs | T2: %.3fs | T3: %.3fs | T4: %.3fs | Tendência: %s\n",
-               media,
-               tempo1_us / 1e6,
-               tempo2_us / 1e6,
-               tempo3_us / 1e6,
-               tempo4_us / 1e6,
-               tendencia_para_texto(t));
-
-        sleep_ms(1000);  // Aguarda próximo ciclo
+        tarefa_1();                    // Tarefa 1: lê a temperatura via DMA e calcula média
+        agendar_tarefas_dependentes(); // Reagenda as tarefas 2-6 após leitura de temperatura
     }
 
     return 0;
 }
 
 /*******************************/
+// Executa a leitura da temperatura usando DMA e salva a média
 void tarefa_1() {
-    // --- Tarefa 1: Leitura de temperatura via DMA ---
-    ini_tarefa1 = get_absolute_time();
-    media = tarefa1_obter_media_temp(&cfg_temp, DMA_TEMP_CHANNEL);
-    fim_tarefa1 = get_absolute_time();
+    ini_tarefa1 = get_absolute_time(); // Marca o tempo de início
+    media = tarefa1_obter_media_temp(&cfg_temp, DMA_TEMP_CHANNEL); // Lê e calcula a média
+    fim_tarefa1 = get_absolute_time(); // Marca o tempo de fim
 }
 
 /*******************************/
+// Cancela timers antigos e agenda novas execuções das tarefas dependentes
+void agendar_tarefas_dependentes() {
+    // Cancela os timers antigos (para evitar múltiplas execuções)
+    cancel_repeating_timer(&timer_tarefa2);
+    cancel_repeating_timer(&timer_tarefa3);
+    cancel_repeating_timer(&timer_tarefa4);
+    cancel_repeating_timer(&timer_tarefa5);
+    cancel_repeating_timer(&timer_tarefa6);  
+
+    // Agenda os callbacks para executarem 500ms após a tarefa 1
+    add_repeating_timer_ms(500, tarefa_2_callback, NULL, &timer_tarefa2);
+    add_repeating_timer_ms(500, tarefa_3_callback, NULL, &timer_tarefa3);
+    add_repeating_timer_ms(500, tarefa_4_callback, NULL, &timer_tarefa4);
+    add_repeating_timer_ms(500, tarefa_5_callback, NULL, &timer_tarefa5);
+    add_repeating_timer_ms(500, tarefa_6_serial_monitor, NULL, &timer_tarefa6); // Monitor serial
+}
+
+/*******************************/
+// Analisa a tendência de variação da temperatura
 bool tarefa_2_callback(repeating_timer_t *rt) {
-    // --- Tarefa 2: Análise da tendência térmica ---
-    ini_tarefa2 = get_absolute_time();
-    t = tarefa3_analisa_tendencia(media);
-    fim_tarefa2 = get_absolute_time();
-    return true;
+    ini_tarefa2 = get_absolute_time();              // Marca início da tarefa
+    t = tarefa3_analisa_tendencia(media);           // Calcula tendência (subindo, caindo etc.)
+    fim_tarefa2 = get_absolute_time();              // Marca fim da tarefa
+    return false; // Timer não deve repetir (executa uma vez por ciclo)
 }
 
 /*******************************/
-bool tarefa_3_callback(repeating_timer_t *rt){
-    // --- Tarefa 3: Exibição no OLED ---
-    ini_tarefa3 = get_absolute_time();
-    tarefa2_exibir_oled(media, t);
-    fim_tarefa3 = get_absolute_time();
+// Exibe a temperatura e a tendência no display OLED
+bool tarefa_3_callback(repeating_timer_t *rt) {
+    ini_tarefa3 = get_absolute_time();              // Início
+    tarefa2_exibir_oled(media, t);                  // Mostra valores e tendência no OLED
+    fim_tarefa3 = get_absolute_time();              // Fim
+    return false;
 }
 
 /*******************************/
+// Atualiza a cor da matriz NeoPixel de acordo com a tendência
 bool tarefa_4_callback(repeating_timer_t *rt) {
-    // --- Tarefa 4: Cor da matriz NeoPixel por tendência ---
-    ini_tarefa4 = get_absolute_time();
-    tarefa4_matriz_cor_por_tendencia(t);
-    fim_tarefa4 = get_absolute_time();
-    return true;
+    ini_tarefa4 = get_absolute_time();              // Início
+    tarefa4_matriz_cor_por_tendencia(t);            // Atualiza cor conforme tendência
+    fim_tarefa4 = get_absolute_time();              // Fim
+    return false;
 }
 
 /*******************************/
+// Pisca os LEDs em branco caso a temperatura seja inferior a 1°C
 bool tarefa_5_callback(repeating_timer_t *rt) {
-    // --- Tarefa 5: Alerta quando temperatura < 1°C ---
-    if (media < 1.0f) {
+    if (media < 1.0f) { // Temperatura crítica
         if (!alerta_estado) {
-            npSetAll(COR_BRANCA);
+            npSetAll(COR_BRANCA); // Acende todos os LEDs
             npWrite();
             alerta_estado = true;
         } else {
-            npClear();
+            npClear();            // Desliga todos os LEDs
             npWrite();
             alerta_estado = false;
         }
     } else {
         if (alerta_estado) {
-            npClear();
+            npClear();            // Garante que os LEDs sejam desligados se já estavam piscando
             npWrite();
             alerta_estado = false;
         }
     }
-    return true;
+    return false;
+}
+
+/*******************************/
+// Imprime as leituras e tempos de execução no terminal serial USB
+bool tarefa_6_serial_monitor(repeating_timer_t *rt) {
+    printf("Temperatura: %.2f °C | T1: %.3fs | T2: %.3fs | T3: %.3fs | T4: %.3fs | Tendência: %s\n",
+           media,
+           absolute_time_diff_us(ini_tarefa1, fim_tarefa1) / 1e6, // Tempo em segundos
+           absolute_time_diff_us(ini_tarefa2, fim_tarefa2) / 1e6,
+           absolute_time_diff_us(ini_tarefa3, fim_tarefa3) / 1e6,
+           absolute_time_diff_us(ini_tarefa4, fim_tarefa4) / 1e6,
+           tendencia_para_texto(t)); // Mostra a tendência em texto
+    return false;
 }
